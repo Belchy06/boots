@@ -1,9 +1,14 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
+	"fmt"
+	"math/rand"
+	"net"
 	"os"
 	"runtime"
+	"strconv"
 
 	"github.com/avast/retry-go"
 	"github.com/gammazero/workerpool"
@@ -17,8 +22,56 @@ import (
 )
 
 var listenAddr = conf.BOOTPBind
+var server *DHCPServer
+
+type DHCPServer struct {
+	start      net.IP        // Start of IP range to distribute
+	subnet     net.IP        // Hardware subnet mask
+	gateway    net.IP        // Gateway IP
+	leaseRange int           // Number of IPs to distribute (starting from start)
+	leases     map[int]lease // Map to keep track of leases
+}
+
+type lease struct {
+	nic string // Client's CHAddr
+}
 
 func init() {
+	var start string
+	if start = os.Getenv("START_IP"); start == "" {
+		start = "192.168.1.2/24"
+	}
+	ip, mask, err := net.ParseCIDR(start)
+	subnet := net.IP(mask.Mask)
+
+	if err != nil {
+		mainlog.Fatal(err)
+	}
+
+	var gateway string
+	if gateway = os.Getenv("PUBLIC_IP"); gateway == "" {
+		gateway = "192.168.1.1"
+	}
+	gatewayIP := net.ParseIP(gateway)
+
+	var leaseRange string
+	if leaseRange = os.Getenv("LEASE_RANGE"); leaseRange == "" {
+		leaseRange = "253"
+	}
+	leaserange, err := strconv.Atoi(leaseRange)
+
+	if err != nil {
+		mainlog.Fatal(err)
+	}
+
+	server = &DHCPServer{
+		start:      ip,
+		subnet:     subnet,
+		gateway:    gatewayIP,
+		leaseRange: leaserange,
+		leases:     make(map[int]lease, leaserange),
+	}
+
 	flag.StringVar(&listenAddr, "dhcp-addr", listenAddr, "IP and port to listen on for DHCP.")
 }
 
@@ -53,6 +106,11 @@ func (d dhcpHandler) serveDHCP(w dhcp4.ReplyWriter, req *dhcp4.Packet) {
 		return
 	}
 
+	if req.GetMessageType().String() == "DHCPRELEASE" {
+		server.releaseLease(mac)
+		return
+	}
+
 	gi := req.GetGIAddr()
 	if conf.ShouldIgnoreGI(gi.String()) {
 		mainlog.With("giaddr", gi).Info("giaddr is in ignore list")
@@ -75,7 +133,7 @@ func (d dhcpHandler) serveDHCP(w dhcp4.ReplyWriter, req *dhcp4.Packet) {
 	var j = job.Job{}
 	j, err = job.CreateFromDHCP(mac, gi, circuitID)
 	if err != nil {
-		// Cacher did not find any HW
+		// Tink did not find any HW
 		mainlog.With("mac", mac, "err", err).Info("retrieved hw is empty. MAC address is unknown to tink")
 		metrics.JobsInProgress.With(labels).Dec()
 		timer.ObserveDuration()
@@ -86,18 +144,29 @@ func (d dhcpHandler) serveDHCP(w dhcp4.ReplyWriter, req *dhcp4.Packet) {
 			return
 		} else {
 			mainlog.With("mac", mac).Info("Default workflow enabled")
+
+			// Assign IP address
+			var free int = -1
+			if free = server.freeLease(); free == -1 {
+				// No free IP address to assign
+				mainlog.With("mac", mac).Error(err, "No IP addresses left to assign")
+				metrics.JobsInProgress.With(labels).Dec()
+				timer.ObserveDuration()
+				return
+			}
+			IPaddr := IPAdd(server.start, free)
+
 			// We want default workflows, so at first we will need to create a hardware
-			mainlog.With("mac", mac).Info("Pushing new HW to Tink")
-			j, err = job.CreateHWFromDHCP(mac, gi, circuitID)
+			j, err = job.CreateHWFromDHCP(mac, gi, circuitID, IPaddr, server.subnet, server.gateway)
 			if err != nil {
 				mainlog.With("mac", mac).Error(err, "failed to create hw")
 				metrics.JobsInProgress.With(labels).Dec()
 				timer.ObserveDuration()
 				return
 			}
+			server.addLease(mac, IPaddr)
+			mainlog.Info("DHCPServer has assigned " + strconv.Itoa(len(server.leases)) + " leases of a maximum " + strconv.Itoa(server.leaseRange))
 
-			mainlog.With("mac", mac).Info("created hardware for mac: '" + mac.String() + "' with id: " + j.ID())
-			mainlog.With("mac", mac).Info("Finding default template")
 			// Hardware is now created, we must now grab the 'default' template
 			tid, err := job.GetTemplate("default")
 			if err != nil {
@@ -107,8 +176,6 @@ func (d dhcpHandler) serveDHCP(w dhcp4.ReplyWriter, req *dhcp4.Packet) {
 				return
 			}
 
-			mainlog.With("mac", mac).Info("found default template with id: " + tid)
-			mainlog.With("mac", mac).Info("Creating default workflow for machine: " + mac.String())
 			// We have the 'default' template ID, now to make a workflow from it
 			wid, err := job.CreateWorkflow(tid, mac)
 			if err != nil {
@@ -117,10 +184,9 @@ func (d dhcpHandler) serveDHCP(w dhcp4.ReplyWriter, req *dhcp4.Packet) {
 				timer.ObserveDuration()
 				return
 			}
-			mainlog.With("mac", mac).Info("created default workflow with id: " + wid)
+			mainlog.With("mac", mac).Info(fmt.Sprintf(`Created workflow (%s) for machine (%s) with IP (%s)`, wid, mac.String(), IPaddr.String()))
 		}
 	}
-	mainlog.With("mac", mac).Info("MAC address is known to tink")
 	go func() {
 		if j.ServeDHCP(w, req) {
 			metrics.DHCPTotal.WithLabelValues("send", "DHCPOFFER", gi.String()).Inc()
@@ -143,4 +209,52 @@ func getCircuitID(req *dhcp4.Packet) (string, error) {
 		}
 	}
 	return circuitID, nil
+}
+
+func (s *DHCPServer) freeLease() int {
+	b := rand.Intn(s.leaseRange) // Try random first
+	for _, v := range [][]int{{b, s.leaseRange}, {0, b}} {
+		for i := v[0]; i < v[1]; i++ {
+			if _, ok := s.leases[i]; !ok {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func (s *DHCPServer) addLease(mac net.HardwareAddr, reqIP net.IP) {
+	if leaseNum := IPRange(s.start, reqIP) - 1; leaseNum >= 0 && leaseNum < s.leaseRange {
+		if l, exists := s.leases[leaseNum]; !exists || l.nic == mac.String() {
+			s.leases[leaseNum] = lease{nic: mac.String()}
+		}
+	}
+}
+
+func (s *DHCPServer) releaseLease(mac net.HardwareAddr) {
+	for i, v := range server.leases {
+		if v.nic == mac.String() {
+			delete(server.leases, i)
+			break
+		}
+	}
+}
+
+// IPAdd returns a copy of start + add.
+// IPAdd(net.IP{192,168,1,1},30) returns net.IP{192.168.1.31}
+func IPAdd(ip net.IP, add int) net.IP {
+	inc := uint(add)
+	i := ip.To4()
+	v := uint(i[0])<<24 + uint(i[1])<<16 + uint(i[2])<<8 + uint(i[3])
+	v += inc
+	v3 := byte(v & 0xFF)
+	v2 := byte((v >> 8) & 0xFF)
+	v1 := byte((v >> 16) & 0xFF)
+	v0 := byte((v >> 24) & 0xFF)
+	return net.IPv4(v0, v1, v2, v3)
+}
+
+// IPRange returns how many ips in the ip range from start to stop (inclusive)
+func IPRange(start, stop net.IP) int {
+	return int(binary.BigEndian.Uint32(stop.To4())) - int(binary.BigEndian.Uint32(start.To4())) + 1
 }

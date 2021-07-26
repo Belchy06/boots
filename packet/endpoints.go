@@ -206,9 +206,9 @@ func (c *Client) DiscoverHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, c
 	return &res, nil
 }
 
-func (c *Client) CreateHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID string) (Discovery, error) {
-	if mac == nil {
-		return nil, errors.New("missing MAC address")
+func (c *Client) CreateHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID string, ip net.IP, subnet net.IP, gateway net.IP) (Discovery, error) {
+	if mac == nil || ip == nil || subnet == nil || gateway == nil {
+		return nil, errors.New("Incorrect parameters passed to hardware creation")
 	}
 
 	labels := prometheus.Labels{"from": "dhcp"}
@@ -231,9 +231,9 @@ func (c *Client) CreateHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, cir
 			  "dhcp": {
 				"arch": "x86_64",
 				"ip": {
-				  "address": "192.168.1.5",
-				  "gateway": "192.168.1.1",
-				  "netmask": "255.255.255.248"
+				  "address": "%s",
+				  "gateway": "%s",
+				  "netmask": "%s"
 				},
 				"mac": "%s",
 				"uefi": false
@@ -246,7 +246,7 @@ func (c *Client) CreateHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, cir
 		  ]
 		}
 	  }
-	  `, uuid, mac.String())
+	  `, uuid, ip.String(), gateway.String(), subnet.String(), mac.String())
 	log.Print(data)
 	s := struct {
 		ID string

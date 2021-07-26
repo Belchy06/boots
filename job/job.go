@@ -113,13 +113,13 @@ func CreateFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID string) (Job,
 }
 
 // CreateWorkflowFromDHCP creates a workflow and
-func CreateHWFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID string) (Job, error) {
+func CreateHWFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID string, ip net.IP, subnet net.IP, gateway net.IP) (Job, error) {
 	j := Job{
 		mac:   mac,
 		start: time.Now(),
 	}
 
-	d, err := createHardwareFromDHCP(mac, giaddr, circuitID)
+	d, err := createHardwareFromDHCP(mac, giaddr, circuitID, ip, subnet, gateway)
 	if err != nil {
 		return Job{}, errors.WithMessage(err, "create HW from dhcp message")
 	}

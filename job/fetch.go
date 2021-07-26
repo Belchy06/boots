@@ -22,9 +22,9 @@ func discoverHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID str
 	return v.(packet.Discovery), nil
 }
 
-func createHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID string) (packet.Discovery, error) {
+func createHardwareFromDHCP(mac net.HardwareAddr, giaddr net.IP, circuitID string, ip net.IP, subnet net.IP, gateway net.IP) (packet.Discovery, error) {
 	create := func() (interface{}, error) {
-		return client.CreateHardwareFromDHCP(mac, giaddr, circuitID)
+		return client.CreateHardwareFromDHCP(mac, giaddr, circuitID, ip, subnet, gateway)
 	}
 	v, err := servers.Do(mac.String(), create)
 	if err != nil {
